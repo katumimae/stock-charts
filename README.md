@@ -1,10 +1,10 @@
 # stock-charts
 
-毎朝の寄り前チャート分析用のデータ置き場。
+毎朝の寄り前ブリーフィング＋個別銘柄分析（チャート）用のデータ置き場。
 
 ## 仕組み
-1. GitHub Actions（`.github/workflows/fetch.yml`）が平日 20:05 と 6:20（JST）に `fetch.py` を実行し、J-Quants API v2 から日足・信用残・TOPIX を `data/` に保存してコミットする。
-2. 平日 7:30 に Claude のスケジュールタスクがこのリポジトリを読み、`build_report.py` で指標とチャートを作り、分析を書き加えたページを更新する。
+1. GitHub Actions（`.github/workflows/fetch.yml`）が平日 20:05 と 5:50（JST）に `fetch.py` を実行し、J-Quants API v2 から日足・信用残・TOPIX を `data/` に保存してコミットする。
+2. 平日 6:45ごろ Claude のスケジュールタスクがこのリポジトリを読み、`build_report.py` で指標とチャートを作り、分析を書き加えたページを更新する。
 
 ## 銘柄の追加・削除
 `watchlist.csv` を GitHub の画面で編集するだけ。次回の取得から反映される。

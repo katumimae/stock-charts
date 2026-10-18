@@ -7,7 +7,10 @@
 commentary.json の形式（すべて任意。無い項目は表示しない）:
 {
   "headline": "今日の結論（2〜3行）",
-  "market": "市場サマリー（複数行可）",
+  "markets": [{"name": "S&P500", "value": "6,812.3", "chg": "+0.45%", "note": "最高値更新"}],
+  "market": "前夜〜今朝の市場サマリー（複数行可）",
+  "nt": "NT倍率の水準と方向（拡大/縮小）と地合いの解釈",
+  "sectors": "セクターローテーション・物色の流れ",
   "events": "今日の注目イベント・リスク",
   "stocks": {"8306": {"verdict": "保有", "comment": "根拠", "levels": "注視価格帯"}},
   "candidates": "注目候補",
@@ -244,6 +247,14 @@ def next_earnings(code: str, today: dt.date, confirmed: str | None) -> dict | No
     if not best:
         return None
     est, per = best
+    # 推定日が土日・祝日なら翌営業日にずらす（jpholiday があれば祝日も考慮）
+    try:
+        import jpholiday
+        is_hol = jpholiday.is_holiday
+    except Exception:  # noqa: BLE001
+        is_hol = lambda d: False  # noqa: E731
+    while est.weekday() >= 5 or is_hol(est):
+        est += dt.timedelta(days=1)
     label = {"1Q": "第1四半期", "2Q": "第2四半期（中間）", "3Q": "第3四半期", "FY": "本決算"}.get(per, per)
     return {"date": est.isoformat(), "confirmed": False, "period": label, "days": (est - today).days}
 
@@ -624,6 +635,20 @@ def plan_html(p: dict | None) -> str:
             f'<dl>{"".join(rows)}</dl>{note}{lv}</div>')
 
 
+def markets_html(items: list) -> str:
+    if not items:
+        return ""
+    trs = []
+    for m in items:
+        chg = str(m.get("chg") or "")
+        cls = "up" if chg.startswith("+") else ("dn" if chg.startswith(("-", "−", "▲")) else "")
+        trs.append(f'<tr><td>{esc(m.get("name"))}</td><td class="num">{esc(m.get("value"))}</td>'
+                   f'<td class="num {cls}">{esc(chg)}</td><td class="mnote">{esc(m.get("note"))}</td></tr>')
+    return ('<section class="block"><h3>マーケットの数字</h3><div class="tbl"><table class="mkt">'
+            '<thead><tr><th>指標</th><th class="num">値</th><th class="num">前日比</th><th>メモ</th></tr></thead>'
+            f'<tbody>{"".join(trs)}</tbody></table></div></section>')
+
+
 def cmd_html(commentary_path: str | None) -> None:
     rows, meta = build_all()
     cm = {}
@@ -760,10 +785,13 @@ def cmd_html(commentary_path: str | None) -> None:
         "{{GENERATED}}": esc(now.strftime("%Y-%m-%d %H:%M")),
         "{{FETCHED}}": esc(meta.get("fetched_at", "")[:16].replace("T", " ")),
         "{{HEADLINE}}": paras(cm.get("headline", "")) or '<p class="muted">分析コメントなし（チャートと指標のみ）</p>',
-        "{{MARKET}}": (f'<section class="block"><h3>市場サマリー</h3>{paras(cm["market"])}</section>' if cm.get("market") else ""),
+        "{{TODAY}}": esc(f"{now.month}月{now.day}日（{'月火水木金土日'[now.weekday()]}）"),
+        "{{MARKETS}}": markets_html(cm.get("markets") or []),
+        "{{MARKET}}": (f'<section class="block"><h3>前夜〜今朝の市場</h3>{paras(cm["market"])}</section>' if cm.get("market") else ""),
+        "{{NT}}": (f'<section class="block"><h3>NT倍率・物色の流れ</h3>{paras(cm.get("nt", ""))}{paras(cm.get("sectors", ""))}</section>' if (cm.get("nt") or cm.get("sectors")) else ""),
         "{{EARN}}": earn_block,
         "{{EVENTS}}": (f'<section class="block"><h3>今日の注目イベント・リスク</h3>{paras(cm["events"])}</section>' if cm.get("events") else ""),
-        "{{CANDIDATES}}": (f'<section class="block"><h3>注目候補</h3>{paras(cm["candidates"])}</section>' if cm.get("candidates") else ""),
+        "{{CANDIDATES}}": (f'<section class="block"><h3>注目候補（新規）</h3>{paras(cm["candidates"])}</section>' if cm.get("candidates") else ""),
         "{{ROWS}}": "".join(trs),
         "{{CARDS}}": "".join(cards),
         "{{SOURCES}}": (f'<section class="block src"><h3>出典</h3><ul>{src_html}</ul></section>' if src_html else ""),
@@ -865,6 +893,12 @@ td.nm{white-space:normal;min-width:7em}
 .levels{font-size:14px}.levels b{font-weight:700;margin-right:6px}
 .memo{font-size:12px;color:var(--ink-3)}
 .note{font-size:12px;color:var(--ink-3)}
+.jump{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+.jump a{font-size:13px;text-decoration:none;border:1px solid var(--rule);border-radius:999px;padding:2px 12px;background:var(--panel)}
+h2.part{font-size:19px;margin:12px 0 0;padding-top:14px;border-top:2px solid var(--ink);display:flex;gap:8px;align-items:baseline;scroll-margin-top:12px}
+h2.part span{font-family:var(--f-num);color:var(--accent)}
+table.mkt{min-width:420px}
+td.mnote{white-space:normal;color:var(--ink-2);font-size:12px;min-width:10em}
 .sd{display:inline-block;font-size:12px;font-weight:700;padding:0 8px;border-radius:999px;white-space:nowrap}
 .sd-heavy{background:var(--bad-bg);color:var(--bad)} .sd-heavy::before{content:"▼▼ "}
 .sd-mheavy{background:var(--warn-bg);color:var(--warn)} .sd-mheavy::before{content:"▼ "}
@@ -909,15 +943,23 @@ td.nm{white-space:normal;min-width:7em}
 
 <div class="wrap">
   <header class="top">
-    <span class="eyebrow">寄り前チャート分析</span>
-    <h1>{{DATE}} 終値ベース</h1>
-    <span class="stamp">データ取得 {{FETCHED}} ／ 作成 {{GENERATED}} JST</span>
+    <span class="eyebrow">寄り前ブリーフィング ＋ 個別銘柄分析</span>
+    <h1>{{TODAY}}の寄り前</h1>
+    <span class="stamp">株価 {{DATE}} 終値 ／ データ取得 {{FETCHED}} ／ 作成 {{GENERATED}} JST</span>
     {{ERRORS}}
+    <nav class="jump"><a href="#brief">① 寄り前ブリーフィング</a><a href="#stocks">② 個別銘柄の分析</a></nav>
   </header>
 
+  <h2 class="part" id="brief"><span>①</span>寄り前ブリーフィング</h2>
   <section class="headline">{{HEADLINE}}</section>
+  {{MARKETS}}
   {{MARKET}}
+  {{NT}}
+  {{EVENTS}}
+  {{EARN}}
+  {{CANDIDATES}}
 
+  <h2 class="part" id="stocks"><span>②</span>個別銘柄の分析</h2>
   <section class="block">
     <h3>銘柄一覧</h3>
     <div class="tbl"><table>
@@ -926,12 +968,8 @@ td.nm{white-space:normal;min-width:7em}
     </table></div>
   </section>
 
-  {{EARN}}
-  {{EVENTS}}
-
   {{CARDS}}
 
-  {{CANDIDATES}}
   {{SOURCES}}
   <p class="note">信用需給は、J-Quantsの信用残（日次）から、買残が平均出来高の何日分か・信用倍率・買残の増減・現値より上での売買量（含み損を抱えた買い手の多さ）を点数化して判定（上値重い／やや重い／普通／良好）。売買の目安は、直近の高値・安値や移動平均（節目）とATR（平均的な1日の値幅）から自動で算出し、分析で補正したもの。チャートの水平線は青破線＝ブレイク買い、緑点線＝押し目買いゾーン、赤破線＝損切り。日足は J-Quants の調整後株価。陽線＝赤、陰線＝青。線は25日移動平均（黄）と75日移動平均（紫）。RSI欄の帯は50〜60（エントリー目安）、点線は30と70。チャートは横にスワイプで期間移動、タップで値を表示。投資判断の材料であり、売買を推奨するものではありません。</p>
 </div>
