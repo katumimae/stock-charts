@@ -107,6 +107,20 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         errors["topix"] = str(e)[:300]
 
+    # 決算短信の開示履歴（次回決算日の推定に使う）
+    (DATA / "fins").mkdir(parents=True, exist_ok=True)
+    fin_keep = ["DiscDate", "DiscTime", "DocType", "CurPerType", "CurPerEn", "CurFYEn"]
+    for w in watch:
+        c = w["code"]
+        try:
+            fs = cli.get_fin_summary(code=c)
+            if not fs.empty:
+                fs = fs[[k for k in fin_keep if k in fs.columns]].copy()
+                fs["DiscDate"] = pd.to_datetime(fs["DiscDate"], errors="coerce").dt.strftime("%Y-%m-%d")
+                fs.sort_values("DiscDate").to_csv(DATA / "fins" / f"{c}.csv", index=False)
+        except Exception as e:  # noqa: BLE001
+            errors[f"fins:{c}"] = str(e)[:300]
+
     # 決算発表予定（翌営業日分。プランによっては取れない）
     try:
         ec = cli.get_eq_earnings_cal()

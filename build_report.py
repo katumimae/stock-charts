@@ -11,9 +11,15 @@ commentary.json の形式（すべて任意。無い項目は表示しない）:
   "events": "今日の注目イベント・リスク",
   "stocks": {"8306": {"verdict": "保有", "comment": "根拠", "levels": "注視価格帯"}},
   "candidates": "注目候補",
+  "earnings": {"8306": {"date": "2026-11-14", "confirmed": true, "period": "第2四半期（中間）"}},
   "sources": [{"title": "...", "url": "https://..."}]
 }
 verdict は 買い増し / 保有 / 縮小 / 撤退 / 監視 / 新規候補 のいずれか。
+stocks[code] に "plan" を入れると、自動計算した売買の目安を上書きできる（すべて任意・円）:
+  {"breakout": 3520, "breakout_basis": "10/9戻り高値", "breakout_stop": 3400,
+   "pullback_lo": 3380, "pullback_hi": 3420, "pullback_basis": "75日線", "stop": 3300,
+   "note": "一言の補足"}
+earnings は会社発表で確定した決算日を上書きする（推定→確定）。
 """
 from __future__ import annotations
 
@@ -113,6 +119,145 @@ def margin_info(code: str) -> dict | None:
     }
 
 
+EARNINGS_WARN_DAYS = 45   # 決算の何日前から表示するか（約1ヶ月半）
+
+
+def next_earnings(code: str, today: dt.date, confirmed: str | None) -> dict | None:
+    """次回の決算発表日。確定日（翌営業日分の決算発表予定）があればそれを、
+    なければ前年同四半期の開示日 + 364日（同じ曜日）で推定する。"""
+    if confirmed:
+        d = dt.date.fromisoformat(confirmed[:10])
+        if d >= today:
+            return {"date": d.isoformat(), "confirmed": True, "period": "", "days": (d - today).days}
+    p = DATA / "fins" / f"{code}.csv"
+    if not p.exists():
+        return None
+    f = pd.read_csv(p, dtype=str)
+    if f.empty or "DocType" not in f.columns:
+        return None
+    f = f[f["DocType"].str.contains("FinancialStatements", na=False)].dropna(subset=["DiscDate"])
+    if f.empty:
+        return None
+    f["d"] = pd.to_datetime(f["DiscDate"]).dt.date
+    last_disc = f["d"].max()
+    # 前年同期の開示日 + 364日のうち、最新開示より後で、今日以降の最も早いもの
+    best = None
+    for _, r in f.iterrows():
+        est = r["d"] + dt.timedelta(days=364)
+        if est > last_disc + dt.timedelta(days=20) and est >= today - dt.timedelta(days=3):
+            if best is None or est < best[0]:
+                best = (est, str(r.get("CurPerType") or ""))
+    if not best:
+        return None
+    est, per = best
+    label = {"1Q": "第1四半期", "2Q": "第2四半期（中間）", "3Q": "第3四半期", "FY": "本決算"}.get(per, per)
+    return {"date": est.isoformat(), "confirmed": False, "period": label, "days": (est - today).days}
+
+
+def trade_plan(df: pd.DataFrame) -> dict:
+    """チャートの節目から、ブレイク買い・押し目買い・損切り・追いかけ上限の価格を出す。"""
+    n = len(df)
+    c = float(df["c"].iloc[-1])
+    ma25 = float(df["ma25"].iloc[-1])
+    ma75 = float(df["ma75"].iloc[-1]) if not math.isnan(df["ma75"].iloc[-1]) else None
+    tr = pd.concat([df["h"] - df["l"], (df["h"] - df["c"].shift()).abs(), (df["l"] - df["c"].shift()).abs()], axis=1).max(axis=1)
+    atr = float(tr.rolling(14).mean().iloc[-1])
+    slope25 = float(df["ma25"].iloc[-1] / df["ma25"].iloc[-6] - 1) if n > 30 else 0.0
+
+    look = df.iloc[-120:] if n > 120 else df
+    off = n - len(look)
+    hi_piv, lo_piv = [], []
+    K = 5
+    for i in range(off + K, n - K):
+        h, l = df["h"].iloc[i], df["l"].iloc[i]
+        if h == df["h"].iloc[i - K:i + K + 1].max():
+            hi_piv.append((float(h), str(df["Date"].iloc[i])))
+        if l == df["l"].iloc[i - K:i + K + 1].min():
+            lo_piv.append((float(l), str(df["Date"].iloc[i])))
+
+    def md(d):
+        return f"{int(d[5:7])}/{int(d[8:10])}"
+
+    res, sup = [], []   # (価格, ラベル, 種別)
+    h20, l20 = float(df["h"].iloc[-20:].max()), float(df["l"].iloc[-20:].min())
+    if h20 > c * 1.003:
+        res.append((h20, "20日高値", "high"))
+    for p, d in hi_piv:
+        if p > c * 1.003:
+            res.append((p, f"戻り高値({md(d)})", "high"))
+    box_hi = float(look["h"].max())
+    if box_hi > c * 1.003:
+        res.append((box_hi, "6ヶ月高値", "high"))
+    if ma25 > c:
+        res.append((ma25, "25日線", "ma"))
+    if ma75 and ma75 > c:
+        res.append((ma75, "75日線", "ma"))
+    if ma25 < c:
+        sup.append((ma25, "25日線", "ma"))
+    if ma75 and ma75 < c:
+        sup.append((ma75, "75日線", "ma"))
+    for p, d in lo_piv:
+        if p < c * 0.997:
+            sup.append((p, f"押し安値({md(d)})", "low"))
+    if l20 < c * 0.997:
+        sup.append((l20, "20日安値", "low"))
+
+    def dedupe(items, reverse):
+        items = sorted(items, key=lambda x: x[0], reverse=reverse)
+        out = []
+        for it in items:
+            if out and abs(it[0] / out[-1][0] - 1) < 0.012:
+                # 近い節目はまとめる（移動平均より価格の節目を優先しラベルを併記）
+                prev = out[-1]
+                lab = prev[1] if prev[1].count("・") >= 1 else prev[1] + "・" + it[1]
+                out[-1] = (prev[0], lab, prev[2] if prev[2] != "ma" else it[2])
+                continue
+            out.append(it)
+        return out
+
+    res = dedupe(res, reverse=False)
+    sup = dedupe(sup, reverse=True)
+
+    def yen(x):
+        return None if x is None else int(round(x))
+
+    # ブレイク買い：現値から1%以上上にある、最も近い「価格の高値」（移動平均は除く）
+    highs = dedupe([x for x in res if x[2] == "high" and x[0] > c * 1.01], reverse=False)
+    brk = highs[0] if highs else None
+    reclaim = ma25 if c < ma25 else None
+    downtrend = c < ma25 and slope25 < 0 and (ma75 is None or c < ma75)
+
+    # 押し目買い：最も近い下値の節目 〜 +0.5ATR
+    pb = None
+    sup_pb = [x for x in sup if x[0] < c * 0.99]   # 現値から1%以上下の節目を押し目候補に
+    if sup_pb:
+        s1 = sup_pb[0]
+        lo_, hi_ = s1[0], min(s1[0] + 0.5 * atr, c * 0.995)
+        s2 = sup_pb[1][0] if len(sup_pb) > 1 else None
+        # 損切り：次の節目が近ければその少し下、遠ければ押し目下限 − 1ATR
+        stop = lo_ - 1.0 * atr
+        if s2 and lo_ - 1.0 * atr < s2 - 0.3 * atr <= lo_ - 0.5 * atr:
+            stop = s2 - 0.3 * atr
+        pb = {"lo": yen(lo_), "hi": yen(hi_), "basis": s1[1], "stop": yen(stop),
+              "risk_pct": round((stop / ((lo_ + hi_) / 2) - 1) * 100, 1),
+              "caution": "下降トレンド中：節目で下げ止まり（陽線・出来高）を確認してから" if downtrend else ""}
+    bo = None
+    if brk:
+        bstop = max(brk[0] - 1.5 * atr, ma25 if ma25 < brk[0] else 0)
+        bo = {"price": yen(brk[0]), "basis": brk[1], "stop": yen(bstop),
+              "risk_pct": round((bstop / brk[0] - 1) * 100, 1)}
+    return {
+        "atr14": round(atr, 1),
+        "trend": "下降" if downtrend else ("上昇" if c > ma25 and slope25 > 0 else "横ばい"),
+        "breakout": bo,
+        "reclaim_ma25": yen(reclaim),
+        "pullback": pb,
+        "chase_limit": yen(ma25 * 1.05),   # 25日線乖離+5%＝これ以上は追わない
+        "resistances": [{"price": yen(p), "label": lb} for p, lb, _ in res[:4]],
+        "supports": [{"price": yen(p), "label": lb} for p, lb, _ in sup[:4]],
+    }
+
+
 def compute(code: str, topix: pd.DataFrame | None) -> dict | None:
     p = DATA / "bars" / f"{code}.csv"
     if not p.exists():
@@ -192,6 +337,7 @@ def compute(code: str, topix: pd.DataFrame | None) -> dict | None:
         "breakout_with_volume": breakout,
         "margin": mg,
         "entry_check": entry,
+        "plan": trade_plan(df) if n > 30 else None,
         "_chart": {
             "candles": [{"time": r.Date, "open": r2(r.o), "high": r2(r.h), "low": r2(r.l), "close": r2(r.c)}
                         for r in chart.itertuples()],
@@ -209,13 +355,16 @@ def build_all() -> tuple[list[dict], dict]:
     earn = load_earnings()
     tp = pd.read_csv(DATA / "topix.csv") if (DATA / "topix.csv").exists() else None
     meta = json.loads((DATA / "meta.json").read_text(encoding="utf-8")) if (DATA / "meta.json").exists() else {}
+    today = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date()
     rows = []
     for w in watch:
         s = compute(w["code"], tp)
         info = master.get(w["code"], {})
+        ne = next_earnings(w["code"], today, earn.get(w["code"]))
         base = {"code": w["code"], "group": w["group"], "memo": w["memo"],
                 "name": info.get("name", ""), "sector": info.get("sector", ""),
-                "earnings_date": earn.get(w["code"])}
+                "earnings": ne,
+                "earnings_soon": bool(ne and ne["days"] <= EARNINGS_WARN_DAYS)}
         rows.append({**base, **s} if s else {**base, "missing": True})
     return rows, meta
 
@@ -257,6 +406,88 @@ def check_cell(ok) -> str:
     return '<span class="ck ok">○</span>' if ok else '<span class="ck ng">×</span>'
 
 
+def yen(x) -> str:
+    return "—" if x is None else f"{int(round(x)):,}"
+
+
+def md_date(iso: str) -> str:
+    d = dt.date.fromisoformat(iso[:10])
+    return f"{d.month}/{d.day}（{'月火水木金土日'[d.weekday()]}）"
+
+
+def effective_plan(r: dict, c: dict) -> dict | None:
+    """自動計算の価格に、分析コメント側の上書き（commentary.stocks[code].plan）を反映"""
+    base = r.get("plan")
+    if not base:
+        return None
+    p = json.loads(json.dumps(base, default=_np))
+    o = c.get("plan") or {}
+    if o.get("breakout"):
+        p["breakout"] = {**(p.get("breakout") or {}), "price": o["breakout"],
+                         "basis": o.get("breakout_basis") or (p.get("breakout") or {}).get("basis", "")}
+        if o.get("breakout_stop"):
+            p["breakout"]["stop"] = o["breakout_stop"]
+    if o.get("pullback_lo") and o.get("pullback_hi"):
+        p["pullback"] = {**(p.get("pullback") or {}), "lo": o["pullback_lo"], "hi": o["pullback_hi"],
+                         "basis": o.get("pullback_basis") or (p.get("pullback") or {}).get("basis", "")}
+    if o.get("stop"):
+        p.setdefault("pullback", {})["stop"] = o["stop"]
+    for k in ("breakout", "pullback"):
+        q = p.get(k) or {}
+        ref = q.get("price") or ((q.get("lo", 0) + q.get("hi", 0)) / 2 if q.get("lo") else None)
+        if ref and q.get("stop"):
+            q["risk_pct"] = round((q["stop"] / ref - 1) * 100, 1)
+    p["note"] = o.get("note", "")
+    return p
+
+
+def effective_earnings(r: dict, cm: dict) -> dict | None:
+    o = (cm.get("earnings") or {}).get(r["code"])
+    if o and o.get("date"):
+        today = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date()
+        d = dt.date.fromisoformat(o["date"][:10])
+        base = r.get("earnings") or {}
+        return {"date": d.isoformat(), "confirmed": bool(o.get("confirmed", True)),
+                "period": o.get("period") or base.get("period", ""), "days": (d - today).days}
+    return r.get("earnings")
+
+
+def earn_text(e: dict) -> str:
+    tag = "確定" if e["confirmed"] else "推定"
+    days = "本日" if e["days"] == 0 else f"あと{e['days']}日"
+    per = f"{e['period']} " if e.get("period") else ""
+    return f"{per}{md_date(e['date'])} {days}（{tag}）"
+
+
+def plan_html(p: dict | None) -> str:
+    if not p:
+        return ""
+    rows = []
+    b = p.get("breakout")
+    if b:
+        rows.append(f'<div class="pl-row pl-brk"><dt>ブレイク買い</dt><dd><b>{yen(b["price"])}円</b> を終値で上抜け＋出来高1.5倍'
+                    f'<span class="pl-sub">根拠：{esc(b.get("basis"))}／損切り {yen(b.get("stop"))}円（{fmt(b.get("risk_pct"), 1, True, "%")}）</span></dd></div>')
+    if p.get("reclaim_ma25"):
+        rows.append(f'<div class="pl-row pl-brk"><dt>25日線奪回</dt><dd><b>{yen(p["reclaim_ma25"])}円</b> を終値で回復'
+                    f'<span class="pl-sub">下落基調から戻りに転じたかの最初の確認ライン</span></dd></div>')
+    q = p.get("pullback")
+    if q and q.get("lo"):
+        caution = f'<span class="pl-caution">{esc(q["caution"])}</span>' if q.get("caution") else ""
+        rows.append(f'<div class="pl-row pl-pb"><dt>押し目買い</dt><dd><b>{yen(q["lo"])}〜{yen(q["hi"])}円</b>'
+                    f'<span class="pl-sub">根拠：{esc(q.get("basis"))}／損切り {yen(q.get("stop"))}円（{fmt(q.get("risk_pct"), 1, True, "%")}）</span>{caution}</dd></div>')
+    if p.get("chase_limit"):
+        rows.append(f'<div class="pl-row pl-lim"><dt>追いかけ上限</dt><dd><b>{yen(p["chase_limit"])}円</b>'
+                    f'<span class="pl-sub">25日線＋5%。これより上は乖離が大きく、新規では買わない</span></dd></div>')
+    note = f'<p class="pl-note">{esc(p["note"])}</p>' if p.get("note") else ""
+    lv = ""
+    if p.get("resistances") or p.get("supports"):
+        rs = "　".join(f'{yen(x["price"])}（{esc(x["label"])}）' for x in p.get("resistances", [])[:3]) or "—"
+        ss = "　".join(f'{yen(x["price"])}（{esc(x["label"])}）' for x in p.get("supports", [])[:3]) or "—"
+        lv = f'<p class="pl-lv"><span>上値の節目</span>{rs}<br><span>下値の節目</span>{ss}</p>'
+    return (f'<div class="plan"><h4>売買の目安 <span class="pl-trend">トレンド：{esc(p.get("trend"))}</span></h4>'
+            f'<dl>{"".join(rows)}</dl>{note}{lv}</div>')
+
+
 def cmd_html(commentary_path: str | None) -> None:
     rows, meta = build_all()
     cm = {}
@@ -272,11 +503,17 @@ def cmd_html(commentary_path: str | None) -> None:
         v = (stocks_cm.get(r["code"]) or {}).get("verdict", "")
         if r.get("missing"):
             trs.append(f'<tr><td><a href="#s{r["code"]}">{esc(r["code"])}</a></td><td class="nm">{esc(r["name"])}</td>'
-                       f'<td colspan="6" class="muted">データなし</td></tr>')
+                       f'<td colspan="9" class="muted">データなし</td></tr>')
             continue
         mg = r.get("margin") or {}
         updown = "up" if (r["chg"] or 0) > 0 else ("dn" if (r["chg"] or 0) < 0 else "")
         pill = f'<span class="pill {VERDICT_CLASS.get(v, "v-hold")}">{esc(v)}</span>' if v else ""
+        pe = effective_plan(r, stocks_cm.get(r["code"]) or {}) or {}
+        bo = (pe.get("breakout") or {}).get("price")
+        pb = pe.get("pullback") or {}
+        ee = effective_earnings(r, cm)
+        ecell = (f'<span class="ecell{" hot" if ee["days"] <= 14 else ""}">{md_date(ee["date"])}{"" if ee["confirmed"] else "推"}</span>'
+                 if ee and ee["days"] <= EARNINGS_WARN_DAYS else "")
         trs.append(
             f'<tr><td><a href="#s{r["code"]}">{esc(r["code"])}</a></td>'
             f'<td class="nm">{esc(r["name"])}</td>'
@@ -285,6 +522,9 @@ def cmd_html(commentary_path: str | None) -> None:
             f'<td class="num">{fmt(r["rsi"], 1)}</td>'
             f'<td class="num">{fmt(r["dev25"], 1, True, "%")}</td>'
             f'<td class="num">{fmt(mg.get("ratio"), 1, False, "倍") if mg else "—"}</td>'
+            f'<td class="num">{yen(bo) if bo else "—"}</td>'
+            f'<td class="num">{(yen(pb["lo"]) + "〜" + yen(pb["hi"])) if pb.get("lo") else "—"}</td>'
+            f'<td>{ecell}</td>'
             f'<td>{pill}</td></tr>')
 
     # 銘柄カード
@@ -298,7 +538,6 @@ def cmd_html(commentary_path: str | None) -> None:
             cards.append(f'<section class="stock" id="s{code}"><header class="sh"><div class="id"><span class="code">{code}</span>'
                          f'<h2>{esc(r["name"]) or code}</h2></div></header><p class="muted">日足データを取得できませんでした。</p></section>')
             continue
-        chart_data[code] = r["_chart"]
         mg = r.get("margin") or {}
         e = r["entry_check"]
         updown = "up" if (r["chg"] or 0) > 0 else ("dn" if (r["chg"] or 0) < 0 else "")
@@ -307,9 +546,23 @@ def cmd_html(commentary_path: str | None) -> None:
             flags.append("6ヶ月高値を出来高伴い上抜け")
         if r.get("ma25_cross_up_today"):
             flags.append("本日25日線を上抜け")
-        if r.get("earnings_date"):
-            flags.append(f"決算予定 {r['earnings_date']}")
         flag_html = "".join(f'<span class="flag">{esc(f)}</span>' for f in flags)
+        ee = effective_earnings(r, cm)
+        if ee and ee["days"] <= EARNINGS_WARN_DAYS:
+            flags.append("earn")
+            flag_html = (f'<span class="flag earn{" hot" if ee["days"] <= 14 else ""}">決算 {esc(earn_text(ee))}</span>') + flag_html
+        pe = effective_plan(r, c)
+        lines = []
+        if pe:
+            if pe.get("breakout"):
+                lines.append({"price": pe["breakout"]["price"], "kind": "brk", "title": "ブレイク"})
+            q = pe.get("pullback") or {}
+            if q.get("lo"):
+                lines.append({"price": q["hi"], "kind": "pb", "title": "押し目"})
+                lines.append({"price": q["lo"], "kind": "pb", "title": ""})
+            if q.get("stop"):
+                lines.append({"price": q["stop"], "kind": "stop", "title": "損切り"})
+        chart_data[code] = {**r["_chart"], "lines": lines}
         cards.append(f'''
 <section class="stock" id="s{code}">
   <header class="sh">
@@ -337,6 +590,7 @@ def cmd_html(commentary_path: str | None) -> None:
     <span>RSI 50台 {check_cell(e["rsi_ok"])}</span>
     <span>乖離&lt;5% {check_cell(e["dev_ok"])}</span>
   </div>
+  {plan_html(pe)}
   <div class="legend" id="lg{code}" aria-live="polite"></div>
   <div class="chart main" id="c{code}" role="img" aria-label="{esc(r["name"])} 日足チャート（約6ヶ月）"></div>
   <div class="chart rsi" id="r{code}" role="img" aria-label="{esc(r["name"])} RSI"></div>
@@ -348,6 +602,14 @@ def cmd_html(commentary_path: str | None) -> None:
   </div>
 </section>''')
 
+    soon = []
+    for r in rows:
+        ee = effective_earnings(r, cm)
+        if ee and ee["days"] <= EARNINGS_WARN_DAYS:
+            soon.append((ee["days"], f'<li class="{"hot" if ee["days"] <= 14 else ""}"><a href="#s{r["code"]}">{esc(r["code"])} {esc(r["name"])}</a>　{esc(earn_text(ee))}</li>'))
+    earn_block = (f'<section class="block earnblk"><h3>決算が近い銘柄（{EARNINGS_WARN_DAYS}日以内）</h3><ul>{"".join(x for _, x in sorted(soon))}</ul>'
+                  f'<p class="note">推定＝前年同期の発表日から算出。会社の発表で確定したら「確定」に切り替わります。決算をまたぐ新規買いは値幅リスクに注意。</p></section>'
+                  if soon else "")
     src = cm.get("sources") or []
     src_html = "".join(f'<li><a href="{esc(s.get("url"))}" target="_blank" rel="noopener">{esc(s.get("title") or s.get("url"))}</a></li>'
                        for s in src if s.get("url"))
@@ -361,6 +623,7 @@ def cmd_html(commentary_path: str | None) -> None:
         "{{FETCHED}}": esc(meta.get("fetched_at", "")[:16].replace("T", " ")),
         "{{HEADLINE}}": paras(cm.get("headline", "")) or '<p class="muted">分析コメントなし（チャートと指標のみ）</p>',
         "{{MARKET}}": (f'<section class="block"><h3>市場サマリー</h3>{paras(cm["market"])}</section>' if cm.get("market") else ""),
+        "{{EARN}}": earn_block,
         "{{EVENTS}}": (f'<section class="block"><h3>今日の注目イベント・リスク</h3>{paras(cm["events"])}</section>' if cm.get("events") else ""),
         "{{CANDIDATES}}": (f'<section class="block"><h3>注目候補</h3>{paras(cm["candidates"])}</section>' if cm.get("candidates") else ""),
         "{{ROWS}}": "".join(trs),
@@ -461,6 +724,26 @@ td.nm{white-space:normal;min-width:7em}
 .levels{font-size:14px}.levels b{font-weight:700;margin-right:6px}
 .memo{font-size:12px;color:var(--ink-3)}
 .note{font-size:12px;color:var(--ink-3)}
+.flag.earn{border-color:var(--warn);color:var(--warn);background:var(--warn-bg);font-weight:700}
+.flag.earn.hot,.ecell.hot,.earnblk li.hot{color:var(--bad)}
+.flag.earn.hot{border-color:var(--bad);background:var(--bad-bg)}
+.ecell{font-size:12px;color:var(--warn);font-weight:700}
+.earnblk ul{margin:0;padding-left:1.2em;font-size:14px}
+.earnblk li{font-variant-numeric:tabular-nums}
+.plan{border:1px solid var(--rule);border-radius:8px;padding:10px 12px;display:flex;flex-direction:column;gap:6px}
+.plan h4{margin:0;font-size:13px;color:var(--ink-2);display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.pl-trend{font-weight:400;color:var(--ink-3)}
+.plan dl{margin:0;display:flex;flex-direction:column;gap:6px}
+.pl-row{display:grid;grid-template-columns:6.5em minmax(0,1fr);gap:8px;align-items:baseline}
+.pl-row dt{font-size:12px;font-weight:700;padding-left:8px;border-left:3px solid var(--rule)}
+.pl-brk dt{border-left-color:var(--accent)} .pl-pb dt{border-left-color:var(--good)} .pl-lim dt{border-left-color:var(--ink-3)}
+.pl-row dd{margin:0;font-size:14px;font-variant-numeric:tabular-nums}
+.pl-row dd b{font-family:var(--f-num);font-size:16px}
+.pl-sub{display:block;font-size:12px;color:var(--ink-3)}
+.pl-caution{display:block;font-size:12px;color:var(--warn);font-weight:700}
+.pl-note{margin:0;font-size:13px}
+.pl-lv{margin:0;font-size:12px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.pl-lv span{color:var(--ink-3);margin-right:8px}
 .warn{font-size:12px;color:var(--warn)}
 .src ul{margin:0;padding-left:1.2em;font-size:13px;word-break:break-all}
 @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
@@ -480,18 +763,19 @@ td.nm{white-space:normal;min-width:7em}
   <section class="block">
     <h3>銘柄一覧</h3>
     <div class="tbl"><table>
-      <thead><tr><th>コード</th><th>銘柄</th><th class="num">終値</th><th class="num">前日比</th><th class="num">RSI</th><th class="num">25日乖離</th><th class="num">信用倍率</th><th>判断</th></tr></thead>
+      <thead><tr><th>コード</th><th>銘柄</th><th class="num">終値</th><th class="num">前日比</th><th class="num">RSI</th><th class="num">25日乖離</th><th class="num">信用倍率</th><th class="num">ブレイク買い</th><th class="num">押し目買い</th><th>決算</th><th>判断</th></tr></thead>
       <tbody>{{ROWS}}</tbody>
     </table></div>
   </section>
 
+  {{EARN}}
   {{EVENTS}}
 
   {{CARDS}}
 
   {{CANDIDATES}}
   {{SOURCES}}
-  <p class="note">日足は J-Quants の調整後株価。陽線＝赤、陰線＝青。線は25日移動平均（黄）と75日移動平均（紫）。RSI欄の帯は50〜60（エントリー目安）、点線は30と70。チャートは横にスワイプで期間移動、タップで値を表示。投資判断の材料であり、売買を推奨するものではありません。</p>
+  <p class="note">売買の目安は、直近の高値・安値や移動平均（節目）とATR（平均的な1日の値幅）から自動で算出し、分析で補正したもの。チャートの水平線は青破線＝ブレイク買い、緑点線＝押し目買いゾーン、赤破線＝損切り。日足は J-Quants の調整後株価。陽線＝赤、陰線＝青。線は25日移動平均（黄）と75日移動平均（紫）。RSI欄の帯は50〜60（エントリー目安）、点線は30と70。チャートは横にスワイプで期間移動、タップで値を表示。投資判断の材料であり、売買を推奨するものではありません。</p>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
@@ -540,6 +824,7 @@ td.nm{white-space:normal;min-width:7em}
     band.setData(d.rsi.map(p=>({time:p.time,value:60})));
     const rsi = rc.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:true});
     rsi.setData(d.rsi);
+    const lineObjs = (d.lines||[]).map(l=>candle.createPriceLine({price:l.price,lineWidth:1,lineStyle:l.kind==='pb'?1:2,axisLabelVisible:true,title:l.title}));
     const pl = [];
     [30,70].forEach(v=>pl.push(rsi.createPriceLine({price:v,lineWidth:1,lineStyle:2,axisLabelVisible:true,title:''})));
     // 縦軸を0-100に固定
@@ -556,6 +841,8 @@ td.nm{white-space:normal;min-width:7em}
       band.applyOptions({topFillColor1:css('--band'),topFillColor2:css('--band')});
       rsi.applyOptions({color:css('--rsi')});
       pl.forEach(p=>p.applyOptions({color:css('--ink-3')}));
+      const lc={brk:css('--accent'),pb:css('--good'),stop:css('--bad')};
+      lineObjs.forEach((o,i)=>o.applyOptions({color:lc[d.lines[i].kind]}));
     }
     paint();
     main.timeScale().fitContent(); rc.timeScale().fitContent();
