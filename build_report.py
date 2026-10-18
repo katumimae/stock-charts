@@ -20,6 +20,7 @@ stocks[code] に "plan" を入れると、自動計算した売買の目安を�
    "pullback_lo": 3380, "pullback_hi": 3420, "pullback_basis": "75日線", "stop": 3300,
    "note": "一言の補足"}
 earnings は会社発表で確定した決算日を上書きする（推定→確定）。
+stocks[code].supply_note に需給の一言コメントを入れると、信用需給の欄に表示する。
 """
 from __future__ import annotations
 
@@ -93,7 +94,8 @@ def load_earnings() -> dict[str, str]:
     return {str(r[code_col])[:4]: str(r[date_col])[:10] for _, r in e.iterrows()}
 
 
-def margin_info(code: str) -> dict | None:
+def margin_info(code: str, df: pd.DataFrame | None = None) -> dict | None:
+    """信用残（買残・売残）と需給判定。df（日足）があれば分割調整・出来高比・価格帯別出来高も使う。"""
     p = DATA / "margin" / f"{code}.csv"
     if not p.exists():
         return None
@@ -102,21 +104,113 @@ def margin_info(code: str) -> dict | None:
         return None
     # 同日に複数区分がある場合は合計
     g = m.groupby("Date")[["LongVol", "ShrtVol"]].sum().sort_index()
+    g.index = pd.to_datetime(g.index)
+
+    # 株式分割の調整（日足の 未調整終値/調整後終値 ＝ 累積分割係数）
+    if df is not None and "C" in df.columns:
+        f = pd.DataFrame({"d": pd.to_datetime(df["Date"]), "k": (df["C"] / df["c"]).astype(float)}).sort_values("d")
+        k = pd.merge_asof(pd.DataFrame({"d": g.index}), f, on="d", direction="backward")["k"].fillna(1.0).values
+        g["LongVol"] = g["LongVol"].values * k
+        g["ShrtVol"] = g["ShrtVol"].values * k
+
     last = g.iloc[-1]
-    prev = g.iloc[-6] if len(g) >= 6 else (g.iloc[0] if len(g) > 1 else None)
+    last_d = g.index[-1]
+
+    def at_or_before(days):
+        x = g[g.index <= last_d - pd.Timedelta(days=days)]
+        return x.iloc[-1] if len(x) else None
+
+    w1, w4 = at_or_before(7), at_or_before(28)
 
     def ratio(row):
-        return round(float(row["LongVol"]) / float(row["ShrtVol"]), 2) if row["ShrtVol"] else None
+        return round(float(row["LongVol"]) / float(row["ShrtVol"]), 2) if row is not None and row["ShrtVol"] else None
 
-    return {
-        "date": str(g.index[-1]),
+    def chg(a, b):
+        return round((float(a) / float(b) - 1) * 100, 1) if b is not None and b and float(b) > 0 else None
+
+    out = {
+        "date": last_d.strftime("%Y-%m-%d"),
         "long": int(last["LongVol"]),
         "short": int(last["ShrtVol"]),
         "ratio": ratio(last),
-        "long_chg_pct": (round((float(last["LongVol"]) / float(prev["LongVol"]) - 1) * 100, 1)
-                         if prev is not None and prev["LongVol"] else None),
-        "prev_ratio": ratio(prev) if prev is not None else None,
+        "long_chg_1w_pct": chg(last["LongVol"], w1["LongVol"] if w1 is not None else None),
+        "long_chg_4w_pct": chg(last["LongVol"], w4["LongVol"] if w4 is not None else None),
+        "short_chg_4w_pct": chg(last["ShrtVol"], w4["ShrtVol"] if w4 is not None else None),
+        "ratio_4w_ago": ratio(w4),
+        "history": [{"time": d.strftime("%Y-%m-%d"), "long": int(r.LongVol), "short": int(r.ShrtVol)}
+                    for d, r in g.iloc[-60:].iterrows()],
     }
+
+    if df is None or len(df) < 30:
+        return out
+    close = float(df["c"].iloc[-1])
+    vavg20 = float(df["v"].iloc[-20:].mean())
+    out["long_days"] = round(out["long"] / vavg20, 1) if vavg20 else None    # 買残が平均出来高の何日分か
+    out["short_days"] = round(out["short"] / vavg20, 1) if vavg20 else None
+    ret20 = float(df["c"].iloc[-1] / df["c"].iloc[-21] - 1) * 100 if len(df) > 21 else 0.0
+
+    # 価格帯別出来高（直近120日）：現値より上で売買された比率と、最大のしこり帯
+    look = df.iloc[-120:]
+    tp = (look["h"] + look["l"] + look["c"]) / 3
+    vol = look["v"].astype(float)
+    above = float(vol[tp > close].sum() / vol.sum() * 100) if vol.sum() else 0.0
+    out["overhead_pct"] = round(above, 0)
+    lo_, hi_ = float(look["l"].min()), float(look["h"].max())
+    band = None
+    if hi_ > lo_:
+        bins = 16
+        w = (hi_ - lo_) / bins
+        idx = ((tp - lo_) / w).clip(0, bins - 1).astype(int)
+        prof = vol.groupby(idx).sum()
+        up = prof[[i for i in prof.index if lo_ + i * w > close]]
+        if len(up):
+            i = int(up.idxmax())
+            share = float(up.max() / vol.sum() * 100)
+            if share >= 7:
+                band = {"lo": int(round(lo_ + i * w)), "hi": int(round(lo_ + (i + 1) * w)), "share": round(share, 0)}
+    out["overhead_band"] = band
+
+    # 需給スコア（＋が上値が重い方向）
+    score, why = 0, []
+    D, R = out.get("long_days"), out.get("ratio")
+    if D is not None:
+        # 大型株は出来高が多く日数が小さく出るため、重い側だけ点数化し、軽い側は記載のみ
+        if D >= 5:
+            score += 2; why.append(f"買残が平均出来高の{D}日分と多い（売りに回ると吸収に時間がかかる）")
+        elif D >= 2.5:
+            score += 1; why.append(f"買残が平均出来高の{D}日分とやや多い")
+        else:
+            why.append(f"買残は平均出来高の{D}日分で、出来高に対しては軽い")
+    if R is not None:
+        if R >= 50:
+            score += 2; why.append(f"信用倍率{R}倍（売り方不在）")
+        elif R >= 15:
+            score += 1; why.append(f"信用倍率{R}倍と買い偏重")
+        elif R < 2:
+            score -= 1; why.append(f"信用倍率{R}倍と売り残が厚い")
+    lc4 = out.get("long_chg_4w_pct")
+    if lc4 is not None:
+        if lc4 >= 15 and ret20 < 0:
+            score += 1; why.append(f"下落中に買残が4週で{lc4:+.0f}%（買い下がりで戻り売り圧力）")
+        elif lc4 >= 25:
+            score += 1; why.append(f"買残が4週で{lc4:+.0f}%と急増")
+        elif lc4 <= -15:
+            score -= 1; why.append(f"買残が4週で{lc4:+.0f}%と整理進む")
+    if above >= 45:
+        score += 1; why.append(f"直近6ヶ月の出来高の{above:.0f}%が現値より上（含み損の戻り売りが出やすい）")
+    elif above <= 15:
+        score -= 1; why.append(f"現値より上の売買は6ヶ月出来高の{above:.0f}%のみ（上に抵抗が少ない）")
+    sd = out.get("short_days")
+    if sd is not None and sd >= 1.5 and (R or 99) < 3:
+        score -= 1; why.append(f"売残が出来高{sd}日分（買い戻しで踏み上げ余地）")
+    if band:
+        why.append(f"{band['lo']:,}〜{band['hi']:,}円に売買が集中（6ヶ月出来高の{band['share']:.0f}%）＝戻りの抵抗帯")
+
+    label = "上値重い" if score >= 4 else "やや重い" if score >= 2 else "良好" if score <= -2 else "普通"
+    out["sd_score"] = score
+    out["sd_label"] = label
+    out["sd_reasons"] = why
+    return out
 
 
 EARNINGS_WARN_DAYS = 45   # 決算の何日前から表示するか（約1ヶ月半）
@@ -303,7 +397,7 @@ def compute(code: str, topix: pd.DataFrame | None) -> dict | None:
         if d0 in t.index and d1 in t.index:
             rel20 = round(ret(20) - (t[d1] / t[d0] - 1) * 100, 2)
 
-    mg = margin_info(code)
+    mg = margin_info(code, df)
     rsi = round(float(L["rsi"]), 1) if not math.isnan(L["rsi"]) else None
     entry = {
         "margin_ok": (mg["ratio"] is not None and mg["ratio"] < 50) if mg else None,
@@ -372,7 +466,12 @@ def build_all() -> tuple[list[dict], dict]:
 def cmd_summary() -> None:
     rows, meta = build_all()
     OUT.mkdir(exist_ok=True)
-    slim = [{k: v for k, v in r.items() if k != "_chart"} for r in rows]
+    slim = []
+    for r in rows:
+        x = {k: v for k, v in r.items() if k != "_chart"}
+        if isinstance(x.get("margin"), dict):
+            x["margin"] = {k: v for k, v in x["margin"].items() if k != "history"}
+        slim.append(x)
     payload = {"meta": meta, "stocks": slim}
     (OUT / "summary.json").write_text(json.dumps(payload, ensure_ascii=False, indent=1, default=_np), encoding="utf-8")
     print(json.dumps(payload, ensure_ascii=False, indent=1, default=_np))
@@ -459,6 +558,43 @@ def earn_text(e: dict) -> str:
     return f"{per}{md_date(e['date'])} {days}（{tag}）"
 
 
+SD_CLASS = {"上値重い": "sd-heavy", "やや重い": "sd-mheavy", "普通": "sd-norm", "良好": "sd-good"}
+
+
+def sd_pill(mg: dict | None) -> str:
+    if not mg or not mg.get("sd_label"):
+        return "—"
+    return f'<span class="sd {SD_CLASS[mg["sd_label"]]}">{esc(mg["sd_label"])}</span>'
+
+
+def man(x) -> str:
+    """株数を「万株」で"""
+    if x is None:
+        return "—"
+    v = x / 10000
+    return f"{v:,.0f}万株" if v >= 100 else f"{v:,.1f}万株"
+
+
+def margin_html(code: str, mg: dict | None, note: str = "") -> str:
+    if not mg:
+        return ""
+    reasons = "".join(f"<li>{esc(w)}</li>" for w in mg.get("sd_reasons", []))
+    note_html = f'<p class="pl-note">{esc(note)}</p>' if note else ""
+    return f'''<div class="mgbox">
+    <h4>信用需給 {sd_pill(mg)} <span class="pl-trend">{esc(mg["date"][5:].replace("-", "/"))}申込分</span></h4>
+    <dl class="mgkpi">
+      <div><dt>信用買残</dt><dd>{man(mg["long"])}<small>4週 {fmt(mg.get("long_chg_4w_pct"), 0, True, "%")}</small></dd></div>
+      <div><dt>信用売残</dt><dd>{man(mg["short"])}<small>4週 {fmt(mg.get("short_chg_4w_pct"), 0, True, "%")}</small></dd></div>
+      <div><dt>信用倍率</dt><dd>{fmt(mg.get("ratio"), 2, False, "倍")}<small>4週前 {fmt(mg.get("ratio_4w_ago"), 1, False, "倍")}</small></dd></div>
+      <div><dt>買残÷平均出来高</dt><dd>{fmt(mg.get("long_days"), 1, False, "日分")}<small>売残 {fmt(mg.get("short_days"), 1, False, "日分")}</small></dd></div>
+    </dl>
+    {f'<ul class="mgwhy">{reasons}</ul>' if reasons else ''}
+    {note_html}
+    <div class="chart mg" id="m{code}" role="img" aria-label="信用買残と売残の推移"></div>
+    <div class="mglg"><span><i class="sw" style="background:var(--mg-long)"></i>買残</span><span><i class="sw" style="background:var(--mg-short)"></i>売残</span></div>
+  </div>'''
+
+
 def plan_html(p: dict | None) -> str:
     if not p:
         return ""
@@ -503,7 +639,7 @@ def cmd_html(commentary_path: str | None) -> None:
         v = (stocks_cm.get(r["code"]) or {}).get("verdict", "")
         if r.get("missing"):
             trs.append(f'<tr><td><a href="#s{r["code"]}">{esc(r["code"])}</a></td><td class="nm">{esc(r["name"])}</td>'
-                       f'<td colspan="9" class="muted">データなし</td></tr>')
+                       f'<td colspan="10" class="muted">データなし</td></tr>')
             continue
         mg = r.get("margin") or {}
         updown = "up" if (r["chg"] or 0) > 0 else ("dn" if (r["chg"] or 0) < 0 else "")
@@ -522,6 +658,7 @@ def cmd_html(commentary_path: str | None) -> None:
             f'<td class="num">{fmt(r["rsi"], 1)}</td>'
             f'<td class="num">{fmt(r["dev25"], 1, True, "%")}</td>'
             f'<td class="num">{fmt(mg.get("ratio"), 1, False, "倍") if mg else "—"}</td>'
+            f'<td>{sd_pill(mg)}</td>'
             f'<td class="num">{yen(bo) if bo else "—"}</td>'
             f'<td class="num">{(yen(pb["lo"]) + "〜" + yen(pb["hi"])) if pb.get("lo") else "—"}</td>'
             f'<td>{ecell}</td>'
@@ -562,7 +699,7 @@ def cmd_html(commentary_path: str | None) -> None:
                 lines.append({"price": q["lo"], "kind": "pb", "title": ""})
             if q.get("stop"):
                 lines.append({"price": q["stop"], "kind": "stop", "title": "損切り"})
-        chart_data[code] = {**r["_chart"], "lines": lines}
+        chart_data[code] = {**r["_chart"], "lines": lines, "margin": (mg or {}).get("history", [])}
         cards.append(f'''
 <section class="stock" id="s{code}">
   <header class="sh">
@@ -591,6 +728,7 @@ def cmd_html(commentary_path: str | None) -> None:
     <span>乖離&lt;5% {check_cell(e["dev_ok"])}</span>
   </div>
   {plan_html(pe)}
+  {margin_html(code, mg, c.get("supply_note", ""))}
   <div class="legend" id="lg{code}" aria-live="polite"></div>
   <div class="chart main" id="c{code}" role="img" aria-label="{esc(r["name"])} 日足チャート（約6ヶ月）"></div>
   <div class="chart rsi" id="r{code}" role="img" aria-label="{esc(r["name"])} RSI"></div>
@@ -652,6 +790,7 @@ TEMPLATE = r"""<title>朝のチャート分析</title>
   --up:#e34948; --dn:#2a78d6; --ma25:#c98a00; --ma75:#6250d6; --rsi:#4f5563; --band:rgba(52,64,143,.08);
   --vol-up:rgba(227,73,72,.35); --vol-dn:rgba(42,120,214,.35);
   --good:#0f7a3d; --good-bg:#e3f4ea; --warn:#9a6400; --warn-bg:#fbf0d9; --bad:#b42323; --bad-bg:#fbe4e4; --neu-bg:#eceff4;
+  --mg-long:#eb6834; --mg-short:#1baf7a;
   --f-body:"BIZ UDPGothic","Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,system-ui,sans-serif;
   --f-num:"Roboto Mono",ui-monospace,"SFMono-Regular",Menlo,monospace;
 }
@@ -661,6 +800,7 @@ TEMPLATE = r"""<title>朝のチャート分析</title>
   --up:#e66767; --dn:#3987e5; --ma25:#d9a020; --ma75:#9085e9; --rsi:#b4bac6; --band:rgba(154,165,240,.10);
   --vol-up:rgba(230,103,103,.35); --vol-dn:rgba(57,135,229,.35);
   --good:#6fd39a; --good-bg:#183324; --warn:#e8b75a; --warn-bg:#352a12; --bad:#f08a8a; --bad-bg:#3a1c1c; --neu-bg:#262a32;
+  --mg-long:#d95926; --mg-short:#199e70;
   color-scheme:dark}}
 :root[data-theme="dark"]{
   --bg:#121418; --panel:#1a1d23; --ink:#eceef2; --ink-2:#b4bac6; --ink-3:#8a91a0; --rule:#2c313a;
@@ -668,6 +808,7 @@ TEMPLATE = r"""<title>朝のチャート分析</title>
   --up:#e66767; --dn:#3987e5; --ma25:#d9a020; --ma75:#9085e9; --rsi:#b4bac6; --band:rgba(154,165,240,.10);
   --vol-up:rgba(230,103,103,.35); --vol-dn:rgba(57,135,229,.35);
   --good:#6fd39a; --good-bg:#183324; --warn:#e8b75a; --warn-bg:#352a12; --bad:#f08a8a; --bad-bg:#3a1c1c; --neu-bg:#262a32;
+  --mg-long:#d95926; --mg-short:#199e70;
   color-scheme:dark}
 *{box-sizing:border-box}
 body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:15px;line-height:1.7;
@@ -724,6 +865,23 @@ td.nm{white-space:normal;min-width:7em}
 .levels{font-size:14px}.levels b{font-weight:700;margin-right:6px}
 .memo{font-size:12px;color:var(--ink-3)}
 .note{font-size:12px;color:var(--ink-3)}
+.sd{display:inline-block;font-size:12px;font-weight:700;padding:0 8px;border-radius:999px;white-space:nowrap}
+.sd-heavy{background:var(--bad-bg);color:var(--bad)} .sd-heavy::before{content:"▼▼ "}
+.sd-mheavy{background:var(--warn-bg);color:var(--warn)} .sd-mheavy::before{content:"▼ "}
+.sd-norm{background:var(--neu-bg);color:var(--ink-2)} .sd-norm::before{content:"― "}
+.sd-good{background:var(--good-bg);color:var(--good)} .sd-good::before{content:"▲ "}
+.mgbox{border:1px solid var(--rule);border-radius:8px;padding:10px 12px;display:flex;flex-direction:column;gap:6px}
+.mgbox h4{margin:0;font-size:13px;color:var(--ink-2);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.mgkpi{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px 12px;margin:0}
+@media (max-width:480px){.mgkpi{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.mgkpi div{display:flex;flex-direction:column}
+.mgkpi dt{font-size:11px;color:var(--ink-3)}
+.mgkpi dd{margin:0;font-family:var(--f-num);font-size:15px;font-variant-numeric:tabular-nums;display:flex;flex-direction:column}
+.mgkpi small{font-size:11px;color:var(--ink-3);font-family:var(--f-body)}
+.mgwhy{margin:0;padding-left:1.2em;font-size:13px;color:var(--ink-2)}
+.chart.mg{height:110px}
+.mglg{display:flex;gap:14px;font-size:12px;color:var(--ink-2)}
+.mglg .sw{display:inline-block;width:12px;height:2px;vertical-align:middle;margin-right:4px}
 .flag.earn{border-color:var(--warn);color:var(--warn);background:var(--warn-bg);font-weight:700}
 .flag.earn.hot,.ecell.hot,.earnblk li.hot{color:var(--bad)}
 .flag.earn.hot{border-color:var(--bad);background:var(--bad-bg)}
@@ -763,7 +921,7 @@ td.nm{white-space:normal;min-width:7em}
   <section class="block">
     <h3>銘柄一覧</h3>
     <div class="tbl"><table>
-      <thead><tr><th>コード</th><th>銘柄</th><th class="num">終値</th><th class="num">前日比</th><th class="num">RSI</th><th class="num">25日乖離</th><th class="num">信用倍率</th><th class="num">ブレイク買い</th><th class="num">押し目買い</th><th>決算</th><th>判断</th></tr></thead>
+      <thead><tr><th>コード</th><th>銘柄</th><th class="num">終値</th><th class="num">前日比</th><th class="num">RSI</th><th class="num">25日乖離</th><th class="num">信用倍率</th><th>需給</th><th class="num">ブレイク買い</th><th class="num">押し目買い</th><th>決算</th><th>判断</th></tr></thead>
       <tbody>{{ROWS}}</tbody>
     </table></div>
   </section>
@@ -775,7 +933,7 @@ td.nm{white-space:normal;min-width:7em}
 
   {{CANDIDATES}}
   {{SOURCES}}
-  <p class="note">売買の目安は、直近の高値・安値や移動平均（節目）とATR（平均的な1日の値幅）から自動で算出し、分析で補正したもの。チャートの水平線は青破線＝ブレイク買い、緑点線＝押し目買いゾーン、赤破線＝損切り。日足は J-Quants の調整後株価。陽線＝赤、陰線＝青。線は25日移動平均（黄）と75日移動平均（紫）。RSI欄の帯は50〜60（エントリー目安）、点線は30と70。チャートは横にスワイプで期間移動、タップで値を表示。投資判断の材料であり、売買を推奨するものではありません。</p>
+  <p class="note">信用需給は、J-Quantsの信用残（日次）から、買残が平均出来高の何日分か・信用倍率・買残の増減・現値より上での売買量（含み損を抱えた買い手の多さ）を点数化して判定（上値重い／やや重い／普通／良好）。売買の目安は、直近の高値・安値や移動平均（節目）とATR（平均的な1日の値幅）から自動で算出し、分析で補正したもの。チャートの水平線は青破線＝ブレイク買い、緑点線＝押し目買いゾーン、赤破線＝損切り。日足は J-Quants の調整後株価。陽線＝赤、陰線＝青。線は25日移動平均（黄）と75日移動平均（紫）。RSI欄の帯は50〜60（エントリー目安）、点線は30と70。チャートは横にスワイプで期間移動、タップで値を表示。投資判断の材料であり、売買を推奨するものではありません。</p>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
@@ -872,6 +1030,18 @@ td.nm{white-space:normal;min-width:7em}
     const onMove = p => { if(p && p.time){ show(p.time); } else { show(last); } };
     main.subscribeCrosshairMove(onMove); rc.subscribeCrosshairMove(onMove);
     charts.push(paint);
+
+    const elm = document.getElementById('m'+code);
+    if(elm && d.margin && d.margin.length){
+      const mc = LWC.createChart(elm, Object.assign({}, common, theme(), {handleScroll:false,handleScale:false}));
+      const sl = mc.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,priceFormat:{type:'volume'}});
+      const ss = mc.addLineSeries({lineWidth:2,priceLineVisible:false,lastValueVisible:false,priceFormat:{type:'volume'}});
+      sl.setData(d.margin.map(p=>({time:p.time,value:p.long})));
+      ss.setData(d.margin.map(p=>({time:p.time,value:p.short})));
+      mc.priceScale('right').applyOptions({scaleMargins:{top:0.1,bottom:0.05}});
+      const mp=()=>{mc.applyOptions(theme());sl.applyOptions({color:css('--mg-long')});ss.applyOptions({color:css('--mg-short')});};
+      mp(); mc.timeScale().fitContent(); charts.push(mp);
+    }
   });
 
   const repaint = ()=>charts.forEach(f=>f());
