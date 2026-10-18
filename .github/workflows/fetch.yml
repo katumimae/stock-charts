@@ -1,0 +1,43 @@
+name: J-Quantsデータ取得
+
+on:
+  schedule:
+    # 平日 20:05 JST（当日の日足確定後）
+    - cron: "5 11 * * 1-5"
+    # 平日 6:20 JST（朝の信用残などの追加分。朝7:30の分析前の最終更新）
+    - cron: "20 21 * * 0-4"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 依存関係
+        run: pip install "jquants-api-client>=2.8,<3" pandas
+      - name: 取得
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+        run: python fetch.py
+      - name: コミット
+        run: |
+          git config user.name "stock-charts-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "変更なし"
+          else
+            git commit -m "data: $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M') JST"
+            git push
+          fi
