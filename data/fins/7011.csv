@@ -1,6 +1,4 @@
 DiscDate,DiscTime,DocType,CurPerType,CurPerEn,CurFYEn
-2016-10-31,13:30,2QFinancialStatements_Consolidated_JP,2Q,2016-09-30,2017-03-31
-2016-10-31,13:30,EarnForecastRevision,FY,2017-03-31,2017-03-31
 2017-02-02,13:30,3QFinancialStatements_Consolidated_JP,3Q,2016-12-31,2017-03-31
 2017-04-26,15:00,EarnForecastRevision,FY,2017-03-31,2017-03-31
 2017-05-09,13:30,FYFinancialStatements_Consolidated_JP,FY,2017-03-31,2017-03-31
@@ -22,8 +20,8 @@ DiscDate,DiscTime,DocType,CurPerType,CurPerEn,CurFYEn
 2020-10-29,16:00:00,EarnForecastRevision,FY,2021-03-31,2021-03-31
 2020-10-30,13:30:00,2QFinancialStatements_Consolidated_IFRS,2Q,2020-09-30,2021-03-31
 2021-02-04,13:30:00,3QFinancialStatements_Consolidated_IFRS,3Q,2020-12-31,2021-03-31
-2021-05-10,13:30:00,EarnForecastRevision,FY,2021-03-31,2021-03-31
 2021-05-10,13:30:00,FYFinancialStatements_Consolidated_IFRS,FY,2021-03-31,2021-03-31
+2021-05-10,13:30:00,EarnForecastRevision,FY,2021-03-31,2021-03-31
 2021-08-02,13:30:00,1QFinancialStatements_Consolidated_IFRS,1Q,2021-06-30,2022-03-31
 2021-10-29,13:30:00,2QFinancialStatements_Consolidated_IFRS,2Q,2021-09-30,2022-03-31
 2021-10-29,13:30:00,EarnForecastRevision,FY,2022-03-31,2022-03-31
