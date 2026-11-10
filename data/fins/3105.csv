@@ -52,3 +52,4 @@ DiscDate,DiscTime,DocType,CurPerType,CurPerEn,CurFYEn
 2026-05-12,11:30:00,1QFinancialStatements_Consolidated_JP,1Q,2026-03-31,2026-12-31
 2026-08-06,11:30:00,2QFinancialStatements_Consolidated_JP,2Q,2026-06-30,2026-12-31
 2026-09-09,17:30:00,EarnForecastRevision,FY,2026-12-31,2026-12-31
+2026-11-10,11:30:00,3QFinancialStatements_Consolidated_JP,3Q,2026-09-30,2026-12-31
